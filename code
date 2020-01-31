@@ -1,0 +1,156 @@
+
+###############loading data
+read.table("/Users/James/Desktop/交大其他课题/Bingyi_project/BRCA/BRCA.uncv2.mRNAseq_RSEM_normalized_log2.txt",row.names=1,header=T)->a
+
+###############data pre-processing
+rownames(a)->names
+agrep("\\?",names)->ques
+unlist(lapply(names,function(x) strsplit(x,"\\|")[[1]][1]))->filter.names
+filter.names[ques]<-names[ques]
+filter.names[which(filter.names=="SLC35E2")][2]="SLC35E2|9906"
+rownames(a)<-filter.names
+colnames(a)->col.name
+unlist(lapply(col.name,function(x) strsplit(x,"\\.")[[1]][length(strsplit(col.name[1],"\\.")[[1]])]))->type ### distinguish tumor samples and normal samples
+a[,which(type=="01"| type=="06")]->tumor_tmp
+a[,which(type=="11")]->normal_tmp
+
+######## filter lowly expressed genes
+na.omit(a)->a_2
+a_2[which(rowMeans(a_2)>10),]->a_3 ### choose highly expressed genes with expression index > 10
+rownames(a_3)->gene_filter
+
+tumor_tmp[gene_filter,]->tumor
+normal_tmp[gene_filter,]->normal
+
+##########dividing test data and training data
+t.fold <- 10  
+set.seed(1) ### set seed for reproducibility
+train.idx.tumor <- sample(rep(1: t.fold, length.out = dim(tumor)[2]))
+train.idx.normal <- sample(rep(1: t.fold, length.out = dim(normal)[2]))
+tumor[,which(train.idx.tumor <=7)]->tumor_train	 ### 70% training data and 30% test data
+normal[,which(train.idx.normal <=7)]->normal_train ### 70% training data and 30% test data	
+
+tumor[,which(train.idx.tumor>7)]->tumor_test	### 70% tumor samples as training tumor samples 
+normal[,which(train.idx.normal>7)]->normal_test	 ### 70% normal samples as training normal samples 
+
+
+intersect(colnames(tumor_train),colnames(tumor_test))  ### double check samples
+
+
+
+################## cross validation
+n.fold <- 10 ###  set 10 folds
+
+set.seed(1)
+fold.idx.tumor <- sample(rep(1:n.fold, length.out = dim(tumor_train)[2]))
+fold.idx.normal <- sample(rep(1:n.fold, length.out = dim(normal_train)[2]))
+
+library(glmnet)
+library(ROCR)
+library(MLmetrics)
+lambda_out=c()
+rlt<-c()
+AUC=NULL
+F1_value=c()
+for(i in 1: n.fold)
+{
+   ##### 10-fold cross validation and samples set-up
+   tumor_train[,which(fold.idx.tumor!=i)]->tumor_cv	
+   normal_train[,which(fold.idx.normal!=i)]->normal_cv	
+   cbind(tumor_cv, normal_cv)->merge_cv
+   t(merge_cv)-> merge_cv_trans
+
+   tumor_train[,which(fold.idx.tumor==i)]->tumor_cvleft	
+   normal_train[,which(fold.idx.normal==i)]->normal_cvleft
+   cbind(tumor_cvleft, normal_cvleft)->merge_cvleft
+   t(merge_cvleft)-> merge_cvleft_trans
+
+   ##### set labels of tumor or normals; 1 for the tumor and 0 for the normal
+   c(rep(1,dim(tumor_cvleft)[2]),rep(0,dim(normal_cvleft)[2]))->sampleleft_group
+   c(rep(1,dim(tumor_cv)[2]),rep(0,dim(normal_cv)[2]))->sample_group
+
+   ##### calculate the weights of the regression due to the imbalance of the sample size
+   num <- table(sample_group)
+   fraction <- num/length(sample_group)
+   weights <- 1 - fraction[as.character(sample_group)]
+   #intersect(colnames(tumor_cv),colnames(tumor_cvleft))
+
+   ##### use lasso to select the features or genes
+   set.seed(i)
+   cv.glmnet(x= merge_cv_trans,y= sample_group,weights = as.vector(weights),family="binomial")->cv.res
+   lambda_out= c(lambda_out, cv.res $lambda.1se)  ### use cross validation to determine the lambda
+
+   coef(cv.res ,s="lambda.1se")->cv.rlt
+   as.matrix(cv.rlt)->coefs
+   cbind(rlt ,coefs)-> rlt
+
+### select features and re-fit model of logistic regression
+   setdiff(rownames(coefs)[which(coefs!=0)],"(Intercept)")-> coef_select
+
+
+   cbind(sample_group, merge_cv_trans[, coef_select])->re_model
+   glm( sample_group  ~.,family="binomial",weights=weights,data= data.frame(re_model))->model_refit
+   rlt.tmp <- predict(model_refit,newdata= data.frame(merge_cvleft_trans[, coef_select]), type="link")
+   rlt.p <- predict(model_refit,newdata= data.frame(merge_cvleft_trans[, coef_select]), type="response")
+ as.numeric(rlt.p>0.5)-> rlt.catagorical
+##### evaluate the performance of the model in the CV
+   prediction(rlt.tmp,sampleleft_group)->preed
+   perf<-performance(preed,"auc")
+#perf2 <- performance(preed, "tpr", "fpr")
+#plot(perf2,add=F,col="#749EC8",lwd=2)
+   perf@y.values[[1]]->AUC_tmp
+   cbind(AUC, AUC_tmp)->AUC
+  F1_Score(y_pred=rlt.catagorical,y_true=sampleleft_group,positive="1")->F1_value_tmp
+  F1_value<-c(F1_value, F1_value_tmp)
+
+}
+
+
+##### summarize the outputs and performance
+   apply(rlt,1,function(x) sum(x!=0))->filter_tmp
+   rlt[which(filter_tmp>0),]-> rlt_pick
+   
+   library(pheatmap)
+   colnames(rlt_pick)<-paste("k",1:10,sep="_")
+   pheatmap(rlt_pick[-1,],breaks=seq(-0.5,0.5,0.01),cluster_cols=F) ##### Figures
+
+##### re-fit the model by pooling all the training samples
+   cbind(tumor_train, normal_train)->merge_train
+   t(merge_train)-> merge_train_trans
+   c(rep(1,dim(tumor_train)[2]),rep(0,dim(normal_train)[2]))->sample_group_train
+   num_train <- table(sample_group_train)
+   fraction_train <- num/length(sample_group_train)
+   weights_train <- 1 - fraction[as.character(sample_group_train)]
+
+
+##### hyper-parameter lambda is determined by the CV and set.seed(1)
+   glmnet(x= merge_train_trans,y= sample_group_train,weights = as.vector(weights_train),family="binomial",lambda= lambda_out[3])->cv.train
+
+
+   coef(cv.train ,s="lambda.1se")->cv.rlt_train
+   as.matrix(cv.rlt_train)->coefs_train
+
+   setdiff(rownames(coefs_train)[which(coefs_train!=0)],"(Intercept)")-> coef_select_train
+
+ cbind(sample_group_train, merge_train_trans[, coef_select_train])->re_model_train
+
+c(rep(1,dim(tumor_test)[2]),rep(0,dim(normal_test)[2]))->sample_group_test
+
+cbind(tumor_test, normal_test)->merge_test
+t(merge_test)-> merge_test_trans
+
+glm( sample_group_train  ~.,family="binomial",weights=weights_train,data= data.frame(re_model_train))->model_refit_train
+rlt.tmp <- predict(model_refit_train,newdata= data.frame(merge_test_trans[, coef_select_train]), type="link")
+rlt.p <- predict(model_refit_train,newdata= data.frame(merge_test_trans[, coef_select_train]), type="response")
+
+##### performance evaluation for the test data 
+
+prediction(rlt.tmp, sample_group_test)->preed
+perf<-performance(preed,"auc")
+perf2 <- performance(preed, "tpr", "fpr")
+plot(perf2,add=F,col="#749EC8",lwd=2)
+ perf@y.values[[1]]->perf2
+ as.numeric(rlt.p>0.5)-> rlt.catagorical
+
+  F1_Score(y_pred=rlt.catagorical,y_true= sample_group_test,positive="1")->F1_value_tmp
+
